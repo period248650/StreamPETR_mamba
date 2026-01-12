@@ -58,7 +58,12 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     Returns:
         list: The prediction results.
     """
-    model.eval()
+    # 【修复】处理 DDP 包装的模型，避免 _use_replicated_tensor_module 属性错误
+    if hasattr(model, 'module'):
+        model_to_eval = model.module
+    else:
+        model_to_eval = model
+    model_to_eval.eval()
     bbox_results = []
     mask_results = []
     dataset = data_loader.dataset
@@ -69,7 +74,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     have_mask = False
     for i, data in enumerate(data_loader):
         with torch.no_grad():
-            result = model(return_loss=False, rescale=True, **data)
+            result = model_to_eval(return_loss=False, rescale=True, **data)
             # encode mask results
             if isinstance(result, dict):
                 if 'bbox_results' in result.keys():

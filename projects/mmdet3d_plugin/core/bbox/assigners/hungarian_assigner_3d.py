@@ -7,7 +7,12 @@ from mmdet.core.bbox.builder import BBOX_ASSIGNERS
 from mmdet.core.bbox.assigners import AssignResult
 from mmdet.core.bbox.assigners import BaseAssigner
 from mmdet.core.bbox.match_costs import build_match_cost
-from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
+
+# 使用相对导入，避免绝对路径问题
+try:
+    from projects.mmdet3d_plugin.core.bbox.util import normalize_bbox
+except ImportError:
+    from ...util import normalize_bbox
 
 try:
     from scipy.optimize import linear_sum_assignment

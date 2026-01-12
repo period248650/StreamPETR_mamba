@@ -18,6 +18,62 @@ from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner,
                          build_runner, get_dist_info)
 from mmcv.utils import build_from_cfg
 
+# ============================================================
+# 猴子补丁：修复 mmcv 与新版 PyTorch 的兼容性问题
+# 问题：mmcv 的 scatter 函数传递整数 device_ids，但新版 PyTorch 期望 torch.device
+# ============================================================
+def _patch_mmcv_scatter():
+    """修复 mmcv scatter 函数与 PyTorch 的兼容性问题"""
+    try:
+        from mmcv.parallel import scatter_gather
+        
+        _original_scatter = scatter_gather.scatter
+        
+        def _patched_scatter(inputs, target_gpus, dim=0):
+            """将整数 GPU IDs 转换为 torch.device 对象"""
+            if target_gpus and isinstance(target_gpus[0], int):
+                target_gpus = [torch.device('cuda', gpu) for gpu in target_gpus]
+            return _original_scatter(inputs, target_gpus, dim)
+        
+        scatter_gather.scatter = _patched_scatter
+        
+        # 同时修复 scatter_kwargs
+        _original_scatter_kwargs = scatter_gather.scatter_kwargs
+        
+        def _patched_scatter_kwargs(inputs, kwargs, target_gpus, dim=0):
+            """将整数 GPU IDs 转换为 torch.device 对象"""
+            if target_gpus and isinstance(target_gpus[0], int):
+                target_gpus = [torch.device('cuda', gpu) for gpu in target_gpus]
+            return _original_scatter_kwargs(inputs, kwargs, target_gpus, dim)
+        
+        scatter_gather.scatter_kwargs = _patched_scatter_kwargs
+        
+    except Exception as e:
+        warnings.warn(f"Failed to patch mmcv scatter: {e}")
+
+def _patch_pytorch_parallel():
+    """修复 PyTorch nn.parallel._functions 与整数设备 ID 的兼容性问题"""
+    try:
+        from torch.nn.parallel import _functions as parallel_functions
+        
+        _original_get_stream = parallel_functions._get_stream
+        
+        def _patched_get_stream(device):
+            """确保 device 是 torch.device 对象"""
+            if isinstance(device, int):
+                device = torch.device('cuda', device)
+            return _original_get_stream(device)
+        
+        parallel_functions._get_stream = _patched_get_stream
+        
+    except Exception as e:
+        warnings.warn(f"Failed to patch PyTorch parallel functions: {e}")
+
+# 应用补丁
+_patch_mmcv_scatter()
+_patch_pytorch_parallel()
+# ============================================================
+
 from mmdet.core import EvalHook
 
 from mmdet.datasets import (build_dataset,
@@ -76,23 +132,31 @@ def custom_train_detector(model,
         find_unused_parameters = cfg.get('find_unused_parameters', False)
         # Sets the `find_unused_parameters` parameter in
         # torch.nn.parallel.DistributedDataParallel
+        current_device = torch.cuda.current_device()
         model = MMDistributedDataParallel(
             model.cuda(),
-            device_ids=[torch.cuda.current_device()],
+            device_ids=[current_device],
             broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters)
         if eval_model is not None:
             eval_model = MMDistributedDataParallel(
                 eval_model.cuda(),
-                device_ids=[torch.cuda.current_device()],
+                device_ids=[current_device],
                 broadcast_buffers=False,
                 find_unused_parameters=find_unused_parameters)
     else:
+        # 修复：确保 gpu_ids 是正确的设备索引
+        if hasattr(cfg, 'gpu_ids') and len(cfg.gpu_ids) > 0:
+            gpu_id = cfg.gpu_ids[0] if isinstance(cfg.gpu_ids[0], int) else 0
+        else:
+            gpu_id = 0
+        # 修复：使用 torch.device 对象而不是整数，避免 PyTorch 兼容性问题
+        device = torch.device('cuda', gpu_id)
         model = MMDataParallel(
-            model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
+            model.to(device), device_ids=[gpu_id])
         if eval_model is not None:
             eval_model = MMDataParallel(
-                eval_model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
+                eval_model.to(device), device_ids=[gpu_id])
 
 
     # build runner

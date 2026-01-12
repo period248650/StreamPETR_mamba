@@ -1,5 +1,6 @@
 from .focal_head import FocalHead
 from .petr_head_dn import PETRHeadDN
 from .streampetr_head import StreamPETRHead
+from .issm_streampetr_head import ISSMStreamPETRHead
 from .sparse_head import SparseHead
 from .yolox_head import YOLOXHeadCustom
