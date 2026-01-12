@@ -251,7 +251,12 @@ class ISSMStreamPETRHead(AnchorFreeHead):
         if self.num_propagated > 0:
             nn.init.uniform_(self.pseudo_reference_points.weight.data, 0, 1)
             self.pseudo_reference_points.weight.requires_grad = False
-        # 注意：issm_decoder 已在 __init__ 中初始化，不再重置
+        
+        # 【关键修复】显式调用 issm_decoder 的初始化
+        # 确保 dist_mlp、bc_proj、dt_proj 被正确初始化（Xavier），而非默认的 Kaiming
+        # 这对于门控信号的生成至关重要，否则 B 和 C 可能接近 0，阻断 Query 与特征的交互
+        if self.use_issm and self.issm_decoder is not None:
+            self.issm_decoder.init_weights()
 
     def reset_memory(self):
         """重置 Memory Queue"""
@@ -543,12 +548,15 @@ class ISSMStreamPETRHead(AnchorFreeHead):
         # cone 包含：内参 + 最远深度坐标 + 中间深度坐标
         cone = torch.cat([intrinsic, coords3d[..., -3:], coords3d[..., -90:-87]], dim=-1)  # [B, L, 8]
         
-        # === 10. 提取最后一个深度的 3D 坐标用于 ISSM 距离计算 ===
-        # 【关键修复】使用 pc_range 归一化，与 Query anchors 坐标系对齐！
-        # coords3d_raw 是未归一化的原始 3D 坐标，取最后一个深度
-        coords3d_raw_last = coords3d_raw[..., -1, :]  # [B, L, 3] 最后一个深度的原始 xyz
+        # === 10. 提取 3D 坐标用于 ISSM 距离计算 ===
+        # 【关键修复】使用中间深度而非最远深度
+        # 原因：取最远深度（如60m）会导致即使 Query 和像素射线完全重合，
+        # 它们之间的"距离"也很大（如 60m - 10m = 50m），dist_mlp 难以学习这种偏置
+        # 使用中间深度更能代表射线的"代表性位置"，减少距离偏置
+        D_depth = coords3d_raw.shape[2]  # 深度方向的采样数
+        coords3d_raw_mid = coords3d_raw[..., D_depth // 2, :]  # [B, L, 3] 中间深度的 xyz
         img_coords_3d = (
-            (coords3d_raw_last - self.pc_range[0:3]) / 
+            (coords3d_raw_mid - self.pc_range[0:3]) / 
             (self.pc_range[3:6] - self.pc_range[0:3])
         )  # [B, L, 3] 使用 pc_range 归一化，与 anchors 对齐
         
