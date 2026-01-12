@@ -380,7 +380,12 @@ class ISSMStreamPETRHead(AnchorFreeHead):
             curr_query = queries  # [B, N_q, D], N_q = 192 + 64 = 256
             curr_query_pos = query_pos  # [B, N_q, D]
             
-            init_reference_points = reference_points.clone()  # [B, N_q, 3]
+            # 【关键修复】使用可变的 reference_points，而非固定的 init_reference_points
+            # 原因：ISSM 使用 distance gating，dist_mlp 基于 (key_pos - anchor_pos) 生成 B, C, dt
+            # 如果 anchor 固定不动，即使 Query 内容在层间更新了，gate 依然锁死在错误的位置
+            # 这与 Transformer Attention 不同 —— Attention 是全局的，不需要移动 Anchor 也能看到全图
+            # ISSM 是 "聚光灯"，必须把光打到物体上（迭代更新 Anchor）才能看见
+            curr_reference_points = reference_points.clone()  # [B, N_q, 3] 每层都会更新
             
             # 特征缓存（逐层更新）
             curr_feat = img_feats  # 当前层特征
@@ -397,9 +402,10 @@ class ISSMStreamPETRHead(AnchorFreeHead):
                 # 直接使用原始顺序：[front, front_right, front_left, back, back_left, back_right]
                 
                 # === Step 3: 运行单层 ISSM（直接使用原始顺序）===
+                # 【核心】anchors 使用当前层的 reference_points，而非固定的初始值
                 query_out, feat_output = self.issm_decoder.layers[layer_idx](
                     queries=curr_query,  # [B, N_q, D], N_q = 256
-                    anchors=init_reference_points,  # Query 的 3D 锚点
+                    anchors=curr_reference_points,  # Query 的 3D 锚点【每层更新】
                     features_perm=feat_input,  # 直接使用，不重排
                     pos_embed_perm=pos_embed,
                     key_pos_3d=img_coords_3d_for_issm,  # Key 的 3D 坐标
@@ -409,8 +415,8 @@ class ISSMStreamPETRHead(AnchorFreeHead):
                 # === Step 4: 预测分类和回归 ===
                 cls_scores = self.cls_branches[layer_idx](query_out)  # [B, N_q, num_cls]
                 
-                # 回归预测基于初始 reference_points
-                reference = inverse_sigmoid(init_reference_points.clone())
+                # 回归预测基于【当前层的】 reference_points（而非固定的初始值）
+                reference = inverse_sigmoid(curr_reference_points.clone())
                 tmp = self.reg_branches[layer_idx](query_out)
                 tmp[..., 0:3] += reference[..., 0:3]
                 tmp[..., 0:3] = tmp[..., 0:3].sigmoid()
@@ -419,11 +425,19 @@ class ISSMStreamPETRHead(AnchorFreeHead):
                 all_cls_scores.append(cls_scores)
                 all_bbox_preds.append(bbox_preds)
                 all_output_queries.append(query_out)
-                all_output_reference_points.append(init_reference_points)
+                all_output_reference_points.append(curr_reference_points.clone())
                 
                 # === Step 5: 更新状态 ===
                 curr_query = query_out
                 curr_feat = feat_output  # 逐层更新特征
+                
+                # 【关键】迭代更新 reference_points（Anchor Refinement）
+                # 打破 "近视死锁"：
+                #   Layer 1: Anchor 是随机的，预测勉强往物体方向挪了一点
+                #   Layer 2: Anchor 更新到预测位置，距离变小，dist_mlp gate 打开
+                #   Layer 3: Anchor 进一步靠近物体，ISSM 终于 "看" 到了清晰的特征
+                # 使用 detach() 防止梯度回流到前面层的预测（稳定训练）
+                curr_reference_points = bbox_preds[..., 0:3].detach()
         else:
             raise NotImplementedError("Original Transformer not implemented")
         
