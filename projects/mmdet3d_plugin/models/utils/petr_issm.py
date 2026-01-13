@@ -52,7 +52,7 @@ class _SingleDirectionISSMLayer(nn.Module):
         dt_min=0.001,
         dt_max=0.1,
         dt_init_floor=1e-4,
-        A_init_range=(1, 16),
+        A_init_range=(0.5, 2.0),  # 【修复】从 (1,16) 改为 (0.5,2)，防止状态衰减太快
         conv_bias=True,
         bias=False,
         dropout=0.0,
@@ -95,7 +95,9 @@ class _SingleDirectionISSMLayer(nn.Module):
             
             # 【与 DEST3D 一致】对数缩放 + 归一化（防止距离过大导致梯度问题）
             # sign(delta) * log2(|delta| * scale + 1) / log2(max_val)
-            log_scale = 512.0
+            # 【修复】log_scale 从 512 改为 20，扩大模型的有效感知范围
+            # 512 太大会导致 0.2m 以外的距离梯度饱和
+            log_scale = 20.0
             max_log_val = 8.0
             delta_encoded = torch.sign(delta) * torch.log2(torch.abs(delta) * log_scale + 1.0) / math.log2(max_log_val)
             delta_encoded = delta_encoded / 4.0  # 归一化到 [-1, 1] 范围
@@ -175,13 +177,17 @@ class _SingleDirectionISSMLayer(nn.Module):
         """Initialize state transition parameters - 初始化状态转移参数"""
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
         
-        # SSM 参数 A
+        # SSM 参数 A（控制状态衰减速率）
+        # 【修复】使用较小的 A 值，防止状态衰减太快
+        # A_init_range=(0.5, 2.0) -> A ∈ [-0.7, -2.0]（衰减率适中）
         A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(*A_init_range)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
         
         # D "skip" 参数
-        self.D = nn.Parameter(torch.ones(self.num_heads))
+        # 【修复】从 1.0 改为 0.1，让 SSM 输出占主导（而非纯 skip connection）
+        # D=1 会导致 y ≈ x（SSM 退化为恒等映射）
+        self.D = nn.Parameter(torch.ones(self.num_heads) * 0.1)
         self.D._no_weight_decay = True
     
     def _init_output_layers(self):
@@ -309,6 +315,65 @@ class _SingleDirectionISSMLayer(nn.Module):
             self.dt_bias.view(1, 1, -1, 1)
         )  # [B, L, nheads, N_q=d_state]
         
+        # === 【调试】打印 SSM 内部状态 ===
+        if not hasattr(self, '_ssm_state_debug_printed'):
+            self._ssm_state_debug_printed = True
+            self._debug_iter = 0
+        
+        # 每 50 个 iteration 打印一次详细信息
+        self._debug_iter += 1
+        if self._debug_iter % 50 == 1:
+            with torch.no_grad():
+                # 距离统计
+                if anchors is not None and key_pos_3d is not None:
+                    dist = torch.norm(
+                        key_pos_3d.unsqueeze(2) - anchors.unsqueeze(1), 
+                        dim=-1
+                    )  # [B, L, N_q]
+                    print(f"\n{'='*60}")
+                    print(f"[SSM Debug] Iteration {self._debug_iter}")
+                    print(f"{'='*60}")
+                    print(f"[Distance] min={dist.min().item():.3f}, max={dist.max().item():.3f}, "
+                          f"mean={dist.mean().item():.3f}, std={dist.std().item():.3f}")
+                    print(f"[Distance] <1m: {(dist < 1).float().mean().item()*100:.1f}%, "
+                          f"<5m: {(dist < 5).float().mean().item()*100:.1f}%, "
+                          f"<10m: {(dist < 10).float().mean().item()*100:.1f}%")
+                
+                # 中间特征统计
+                print(f"[intermediate_feat] shape={intermediate_feat.shape}, "
+                      f"min={intermediate_feat.min().item():.4f}, "
+                      f"max={intermediate_feat.max().item():.4f}, "
+                      f"mean={intermediate_feat.mean().item():.4f}")
+                
+                # B, C 参数统计
+                print(f"[B_ssm] shape={B_ssm.shape}, "
+                      f"min={B_ssm.min().item():.4f}, max={B_ssm.max().item():.4f}, "
+                      f"mean={B_ssm.mean().item():.4f}, std={B_ssm.std().item():.4f}")
+                print(f"[C_ssm] shape={C_ssm.shape}, "
+                      f"min={C_ssm.min().item():.4f}, max={C_ssm.max().item():.4f}, "
+                      f"mean={C_ssm.mean().item():.4f}, std={C_ssm.std().item():.4f}")
+                
+                # dt 参数统计（关键：控制状态更新速率）
+                print(f"[dt] shape={dt.shape}, "
+                      f"min={dt.min().item():.6f}, max={dt.max().item():.4f}, "
+                      f"mean={dt.mean().item():.4f}, std={dt.std().item():.4f}")
+                
+                # dt_bias 参数
+                print(f"[dt_bias learnable] values={self.dt_bias.data.cpu().numpy()}")
+                
+                # A 参数（状态衰减）
+                A_val = -torch.exp(self.A_log.float())
+                print(f"[A] (decay rate) values={A_val.data.cpu().numpy()}")
+                
+                # D 参数（skip connection）
+                print(f"[D] (skip) values={self.D.data.cpu().numpy()}")
+                
+                # initial_states 统计
+                print(f"[initial_states] shape={initial_states.shape}, "
+                      f"min={initial_states.min().item():.4f}, max={initial_states.max().item():.4f}, "
+                      f"mean={initial_states.mean().item():.4f}")
+                print(f"{'='*60}\n")
+        
         # === 5. A 参数 ===
         A = -torch.exp(self.A_log.float())
         A = repeat(A, "h -> h d", d=d_state)  # [nheads, d_state]
@@ -341,6 +406,39 @@ class _SingleDirectionISSMLayer(nn.Module):
         # === 9. Query FFN ===
         query_ffn_normed = self.query_ffn_norm(out_query)
         out_query = out_query + self.query_ffn(query_ffn_normed)
+        
+        # === 【调试】打印 SSM 输出状态 ===
+        if self._debug_iter % 50 == 1:
+            with torch.no_grad():
+                print(f"\n[SSM Output Debug] Iteration {self._debug_iter}")
+                
+                # SSM 输出 y 统计
+                print(f"[y (SSM output)] shape={y.shape}, "
+                      f"min={y.min().item():.4f}, max={y.max().item():.4f}, "
+                      f"mean={y.mean().item():.4f}, std={y.std().item():.4f}")
+                
+                # last_states 统计（Query 更新的来源）
+                print(f"[last_states] shape={last_states.shape}, "
+                      f"min={last_states.min().item():.4f}, max={last_states.max().item():.4f}, "
+                      f"mean={last_states.mean().item():.4f}, std={last_states.std().item():.4f}")
+                
+                # query_update 统计（实际加到 Query 上的更新量）
+                print(f"[query_update] shape={query_update.shape}, "
+                      f"min={query_update.min().item():.4f}, max={query_update.max().item():.4f}, "
+                      f"mean={query_update.mean().item():.4f}, std={query_update.std().item():.4f}")
+                
+                # 输出特征统计
+                print(f"[out_feat] min={out_feat.min().item():.4f}, max={out_feat.max().item():.4f}, "
+                      f"mean={out_feat.mean().item():.4f}")
+                print(f"[out_query] min={out_query.min().item():.4f}, max={out_query.max().item():.4f}, "
+                      f"mean={out_query.mean().item():.4f}")
+                
+                # 检查是否有 NaN 或 Inf
+                has_nan = torch.isnan(out_query).any() or torch.isnan(out_feat).any()
+                has_inf = torch.isinf(out_query).any() or torch.isinf(out_feat).any()
+                if has_nan or has_inf:
+                    print(f"[WARNING] NaN detected: {has_nan}, Inf detected: {has_inf}")
+                print(f"{'='*60}\n")
         
         # === 10. DDP 兼容性：确保所有参数有梯度 ===
         ssm_param_sum = self.A_log.sum() + self.D.sum() + self.dt_bias.sum()

@@ -412,14 +412,77 @@ class ISSMStreamPETRHead(AnchorFreeHead):
                 tmp[..., 0:3] = tmp[..., 0:3].sigmoid()
                 bbox_preds = tmp  # [B, N_q, code_size]
                 
+                # === 【调试】打印层间状态 ===
+                if not hasattr(self, '_head_debug_iter'):
+                    self._head_debug_iter = 0
+                if layer_idx == 0:
+                    self._head_debug_iter += 1
+                
+                if self._head_debug_iter % 50 == 1:
+                    with torch.no_grad():
+                        print(f"\n[Head Layer {layer_idx}] Iteration {self._head_debug_iter}")
+                        
+                        # Anchor 位置统计（归一化坐标 [0,1]）
+                        print(f"[Anchor (normalized)] min={init_reference_points.min().item():.4f}, "
+                              f"max={init_reference_points.max().item():.4f}, "
+                              f"mean={init_reference_points.mean().item():.4f}")
+                        
+                        # 反归一化后的实际位置（米）
+                        anchor_denorm = init_reference_points * (self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3]
+                        print(f"[Anchor (meters)] x: [{anchor_denorm[..., 0].min().item():.1f}, {anchor_denorm[..., 0].max().item():.1f}], "
+                              f"y: [{anchor_denorm[..., 1].min().item():.1f}, {anchor_denorm[..., 1].max().item():.1f}], "
+                              f"z: [{anchor_denorm[..., 2].min().item():.1f}, {anchor_denorm[..., 2].max().item():.1f}]")
+                        
+                        # 预测框位置（归一化）
+                        print(f"[BBox pred (normalized)] min={bbox_preds[..., 0:3].min().item():.4f}, "
+                              f"max={bbox_preds[..., 0:3].max().item():.4f}, "
+                              f"mean={bbox_preds[..., 0:3].mean().item():.4f}")
+                        
+                        # 分类分数统计
+                        cls_probs = cls_scores.sigmoid()
+                        print(f"[Cls scores] max_prob={cls_probs.max().item():.4f}, "
+                              f"mean_prob={cls_probs.mean().item():.4f}, "
+                              f">0.5: {(cls_probs > 0.5).sum().item()}, "
+                              f">0.3: {(cls_probs > 0.3).sum().item()}")
+                        
+                        # Query 特征统计
+                        print(f"[Query out] min={query_out.min().item():.4f}, "
+                              f"max={query_out.max().item():.4f}, "
+                              f"mean={query_out.mean().item():.4f}, "
+                              f"std={query_out.std().item():.4f}")
+                
                 all_cls_scores.append(cls_scores)
                 all_bbox_preds.append(bbox_preds)
                 all_output_queries.append(query_out)
-                all_output_reference_points.append(init_reference_points)
+                all_output_reference_points.append(init_reference_points.clone())
                 
                 # === Step 5: 更新状态 ===
                 curr_query = query_out
                 curr_feat = feat_output  # 逐层更新特征
+                
+                # === Step 6: 【关键修复】层间 Anchor 迭代精炼 ===
+                # ISSM 具有距离门控特性，如果 Anchor 离物体太远，梯度会被切断
+                # 必须将当前层的预测结果作为下一层的新 Anchor，让模型逐步"走近"目标
+                if layer_idx < self.num_pred - 1:
+                    # 1. Detach 切断梯度（StreamPETR 标准做法，避免梯度爆炸）
+                    new_reference_points = bbox_preds[..., 0:3].detach()
+                    
+                    # 2. Clamp 防止数值爆炸（防止 inverse_sigmoid 产生 Inf/NaN）
+                    init_reference_points = new_reference_points.clamp(min=1e-5, max=1-1e-5)
+                    
+                    # === 【调试】打印 Anchor 更新信息 ===
+                    if self._head_debug_iter % 50 == 1:
+                        with torch.no_grad():
+                            anchor_shift = (new_reference_points - all_output_reference_points[-1]).abs()
+                            print(f"[Anchor Update L{layer_idx}->L{layer_idx+1}] "
+                                  f"shift_mean={anchor_shift.mean().item():.4f}, "
+                                  f"shift_max={anchor_shift.max().item():.4f}")
+                    
+                    # 3. 同步更新 Query 位置编码，告诉 ISSM "Anchor 移动了"
+                    curr_query_pos = self.query_embedding(pos2posemb3d(init_reference_points))
+                    # 确保维度匹配 [B, N_q, D]
+                    if curr_query_pos.dim() == 2:
+                        curr_query_pos = curr_query_pos.unsqueeze(0).expand(B, -1, -1)
         else:
             raise NotImplementedError("Original Transformer not implemented")
         
