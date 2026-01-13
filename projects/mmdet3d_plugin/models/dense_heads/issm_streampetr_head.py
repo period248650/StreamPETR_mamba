@@ -58,7 +58,6 @@ class ISSMStreamPETRHead(AnchorFreeHead):
         depth_start=1,
         position_range=[-65, -65, -8.0, 65, 65, 8.0],
         normedlinear=False,
-        # ISSM 特定参数
         use_issm=True,
         issm_num_heads=8,
         init_cfg=None,
@@ -252,9 +251,6 @@ class ISSMStreamPETRHead(AnchorFreeHead):
             nn.init.uniform_(self.pseudo_reference_points.weight.data, 0, 1)
             self.pseudo_reference_points.weight.requires_grad = False
         
-        # 【关键修复】显式调用 issm_decoder 的初始化
-        # 确保 dist_mlp、bc_proj、dt_proj 被正确初始化（Xavier），而非默认的 Kaiming
-        # 这对于门控信号的生成至关重要，否则 B 和 C 可能接近 0，阻断 Query 与特征的交互
         if self.use_issm and self.issm_decoder is not None:
             self.issm_decoder.init_weights()
 
@@ -654,19 +650,7 @@ class ISSMStreamPETRHead(AnchorFreeHead):
                                           unexpected_keys, error_msgs)
 
     def _init_queries(self, B, img_metas, **data):
-        """
-        初始化 Query 和 Anchors
-        
-        参考 StreamPETR 的以下部分：
-        1. streampetr_head.py forward() 第 598-604 行：reference_points 初始化和位置编码
-        2. streampetr_head.py temporal_alignment() 第 420-449 行：完整的时序对齐（现已实现）
-        
-        说明：
-        - 完整保留了 StreamPETR 的 temporal_alignment 功能
-        - 包含 Ego Pose 编码、时间戳编码、Query 传播
-        
-        【v5 更新】：额外返回 query_pos 用于 StreamPETR 风格位置编码
-        
+        """       
         Args:
             B: batch size
             img_metas: 图像元信息
@@ -680,30 +664,25 @@ class ISSMStreamPETRHead(AnchorFreeHead):
         """
         device = self.reference_points.weight.device
         
-        # === 1. 获取可学习的 reference points ===
-        # 对应 streampetr_head.py line 598: reference_points = self.reference_points.weight
+
         reference_points = self.reference_points.weight  # [num_query, 3] in [0,1]
         
-        # === 2. 生成 Query 位置编码 ===
-        # 对应 streampetr_head.py line 600-601
+
         query_pos = self.query_embedding(pos2posemb3d(reference_points))  # [num_query, D]
         # 添加 batch 维度
         query_pos = query_pos.unsqueeze(0).expand(B, -1, -1)  # [B, N_q, D]
         tgt = torch.zeros_like(query_pos)  # [B, N_q, D]
         
-        # 给 reference_points 添加 batch 维度（用于 temporal_alignment）
+
         reference_points = reference_points.unsqueeze(0).expand(B, -1, -1)  # [B, num_query, 3]
         
-        # === 3. 时序对齐（简化版：只传播 num_propagated 个 query）===
-        # 包含 Ego Pose 编码、时间戳编码、Query 传播
+
         tgt, query_pos, reference_points, rec_ego_pose = self.temporal_alignment(
             query_pos, tgt, reference_points
         )
         
         # === 4. 构造返回值 ===
         queries = tgt  # [B, N_q + N_prop, D] 纯 Query 内容特征
-        
-        # reference_points: [B, N_q + N_prop, 3]  对应的 reference points（归一化）
         
         # 反归一化 reference_points 到实际空间
         reference_points_result = reference_points * (self.pc_range[3:6] - self.pc_range[0:3]) + self.pc_range[0:3]  # [B, N_q + N_prop, 3]
