@@ -135,11 +135,10 @@ class ISSMStreamPETR(MVXTwoStageDetector):
         return location
 
     def forward_roi_head(self, location, **data):
-        if (self.aux_2d_only and not self.training) or not self.with_img_roi_head:
-            return {'topk_indexes': None}
-        else:
-            outs_roi = self.img_roi_head(location, **data)
-            return outs_roi
+        """ISSM 版本不使用 topk 特征筛选，仅用于可选的 2D 辅助 loss"""
+        if self.with_img_roi_head and self.training:
+            return self.img_roi_head(location, **data)
+        return None
 
     def forward_pts_train(self,
                           gt_bboxes_3d,
@@ -158,20 +157,21 @@ class ISSMStreamPETR(MVXTwoStageDetector):
         if not requires_grad:
             self.eval()
             with torch.no_grad():
-                outs = self.pts_bbox_head(location, img_metas, None, **data)
+                outs = self.pts_bbox_head(location, img_metas, **data)
             self.train()
         else:
-            outs_roi = self.forward_roi_head(location, **data)
-            topk_indexes = outs_roi['topk_indexes']
-            outs = self.pts_bbox_head(location, img_metas, topk_indexes, **data)
+            outs = self.pts_bbox_head(location, img_metas, **data)
 
         if return_losses:
             loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
             losses = self.pts_bbox_head.loss(*loss_inputs)
+            # 可选的 2D 辅助 loss
             if self.with_img_roi_head:
-                loss2d_inputs = [gt_bboxes, gt_labels, centers2d, depths, outs_roi, img_metas]
-                losses2d = self.img_roi_head.loss(*loss2d_inputs)
-                losses.update(losses2d) 
+                outs_roi = self.forward_roi_head(location, **data)
+                if outs_roi is not None:
+                    loss2d_inputs = [gt_bboxes, gt_labels, centers2d, depths, outs_roi, img_metas]
+                    losses2d = self.img_roi_head.loss(*loss2d_inputs)
+                    losses.update(losses2d) 
             return losses
         else:
             return None
@@ -238,9 +238,8 @@ class ISSMStreamPETR(MVXTwoStageDetector):
     def simple_test_pts(self, img_metas, **data):
         """Test function of point cloud branch."""
         location = self.prepare_location(img_metas, **data)
-        outs_roi = self.forward_roi_head(location, **data)
-        topk_indexes = outs_roi['topk_indexes']
 
+        # 场景切换检测
         if img_metas[0]['scene_token'] != self.prev_scene_token:
             self.prev_scene_token = img_metas[0]['scene_token']
             data['prev_exists'] = data['img'].new_zeros(1)
@@ -248,7 +247,7 @@ class ISSMStreamPETR(MVXTwoStageDetector):
         else:
             data['prev_exists'] = data['img'].new_ones(1)
 
-        outs = self.pts_bbox_head(location, img_metas, topk_indexes, **data)
+        outs = self.pts_bbox_head(location, img_metas, **data)
         bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas)
         bbox_results = [
             bbox3d2result(bboxes, scores, labels)

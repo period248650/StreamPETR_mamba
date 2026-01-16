@@ -34,6 +34,33 @@ except ImportError:
             print("[WARNING] issm_triton not available. Please check the import path.")
 
 
+# ============================================================================
+# GatedFFN: DEST3D 风格的门控前馈网络
+# ============================================================================
+
+class GatedFFN(nn.Module):
+    """DEST3D 风格的门控 FFN (类似 RGBlock，但使用 Linear 而非 Conv1d)"""
+    def __init__(self, in_features, hidden_features=None, out_features=None, 
+                 act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        
+        # fc1 输出 2 倍隐藏维度，用于门控分割
+        self.fc1 = nn.Linear(in_features, hidden_features * 2)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+    
+    def forward(self, x):
+        # 门控机制：分成两路，一路激活后与另一路相乘
+        x, v = self.fc1(x).chunk(2, dim=-1)
+        x = self.act(x) * v  # 门控
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
 
 # ============================================================================
 # Part 1: Single Direction ISSM Layer (DEST3D-Faithful Implementation)
@@ -47,12 +74,12 @@ class _SingleDirectionISSMLayer(nn.Module):
         d_conv=4,
         expand=2,
         num_heads=8,
-        d_dist=16,  # 距离编码的中间维度
+        d_dist=16,  
         chunk_size=256,
         dt_min=0.001,
         dt_max=0.1,
         dt_init_floor=1e-4,
-        A_init_range=(0.5, 2.0),  # 【修复】从 (1,16) 改为 (0.5,2)，防止状态衰减太快
+        A_init_range=(1, 16),  
         conv_bias=True,
         bias=False,
         dropout=0.0,
@@ -67,46 +94,28 @@ class _SingleDirectionISSMLayer(nn.Module):
         self._conv_bias = conv_bias
         self._dropout = dropout
         
-        # 初始化基础参数
         self._init_basic_params(d_model, d_conv, expand, num_heads, d_dist, chunk_size)
-        # 初始化投影层
         self._init_projections()
-        # 初始化时间步参数
         self._init_dt_params(dt_min, dt_max, dt_init_floor)
-        # 初始化状态转移参数
         self._init_state_params(A_init_range)
-        # 初始化输出层
         self._init_output_layers()
-        # 初始化距离权重参数
         self._init_dist_weight_params()
         
         self.register_buffer('_dummy_buffer', torch.zeros(1))
     
     def _compute_distance_features(self, anchors, key_pos_3d, B_batch, L, N_q, device, dtype):
         if key_pos_3d is not None and anchors is not None:
-            # 计算 3D 相对位置: delta = key_pos - query_anchor
-            # anchors: [B, N_q, 3] -> [B, 1, N_q, 3]
-            # key_pos_3d: [B, L, 3] -> [B, L, 1, 3]
             query_pos_expanded = anchors.unsqueeze(1)      # [B, 1, N_q, 3]
             key_pos_expanded = key_pos_3d.unsqueeze(2)     # [B, L, 1, 3]
             
-            # 相对位置
-            delta = key_pos_expanded - query_pos_expanded  # [B, L, N_q, 3]
+            delta = query_pos_expanded - key_pos_expanded  # [B, L, N_q, 3]
             
-            # 【与 DEST3D 一致】对数缩放 + 归一化（防止距离过大导致梯度问题）
-            # sign(delta) * log2(|delta| * scale + 1) / log2(max_val)
-            # 【修复】log_scale 从 512 改为 20，扩大模型的有效感知范围
-            # 512 太大会导致 0.2m 以外的距离梯度饱和
+
             log_scale = 20.0
-            max_log_val = 8.0
-            delta_encoded = torch.sign(delta) * torch.log2(torch.abs(delta) * log_scale + 1.0) / math.log2(max_log_val)
-            delta_encoded = delta_encoded / 4.0  # 归一化到 [-1, 1] 范围
+            delta_encoded = torch.sign(delta) * torch.log2(torch.abs(delta) * log_scale + 1.0) / math.log2(8.0)
+            delta_encoded = delta_encoded / 4.0
             
-            # 通过 MLP 编码距离
             intermediate_feat = self.dist_mlp(delta_encoded)  # [B, L, N_q, d_dist]
-        else:
-            # 【防御性代码】正常调用时不会进入此分支
-            intermediate_feat = torch.zeros(B_batch, L, N_q, self.d_dist, device=device, dtype=dtype)
         
         return intermediate_feat
     
@@ -154,10 +163,8 @@ class _SingleDirectionISSMLayer(nn.Module):
             nn.Linear(dist_hidden, self.d_dist, bias=False, **factory_kwargs)
         )
         
-        # 从中间特征生成 B, C, dt
-        # bc_proj: [d_dist] -> [2] (B 和 C 各一个标量)
+
         self.bc_proj = nn.Linear(self.d_dist, 2, bias=False, **factory_kwargs)
-        # dt_proj: [d_dist] -> [num_heads]
         self.dt_proj = nn.Linear(self.d_dist, self.num_heads, bias=False, **factory_kwargs)
     
     def _init_dt_params(self, dt_min, dt_max, dt_init_floor):
@@ -168,47 +175,38 @@ class _SingleDirectionISSMLayer(nn.Module):
             torch.rand(self.num_heads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         self.dt_bias = nn.Parameter(inv_dt)
         self.dt_bias._no_weight_decay = True
     
     def _init_state_params(self, A_init_range):
-        """Initialize state transition parameters - 初始化状态转移参数"""
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
         
-        # SSM 参数 A（控制状态衰减速率）
-        # 【修复】使用较小的 A 值，防止状态衰减太快
-        # A_init_range=(0.5, 2.0) -> A ∈ [-0.7, -2.0]（衰减率适中）
         A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(*A_init_range)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
         
-        # D "skip" 参数
-        # 【修复】从 1.0 改为 0.1，让 SSM 输出占主导（而非纯 skip connection）
-        # D=1 会导致 y ≈ x（SSM 退化为恒等映射）
-        self.D = nn.Parameter(torch.ones(self.num_heads) * 0.1)
+
+        self.D = nn.Parameter(torch.ones(self.num_heads))
         self.D._no_weight_decay = True
     
     def _init_output_layers(self):
         factory_kwargs = self._factory_kwargs
         
-        # Key 输出层（与 DEST3D 一致：使用 RMSNormGated）
         assert RMSNormGated is not None, "RMSNormGated is required but not available"
         self.key_norm = RMSNormGated(self.d_inner, eps=1e-5, norm_before_gate=False)
         self.out_key_proj = nn.Linear(self.d_inner, self.d_model, bias=self._bias, **factory_kwargs)
         
-        # Query 输出层（从 last_states 恢复）
         self.query_norm = nn.LayerNorm(self.d_inner, **factory_kwargs)
         self.out_query_proj = nn.Linear(self.d_inner, self.d_model, bias=False, **factory_kwargs)
         
-        # Query FFN
-        self.query_ffn = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model * 4, **factory_kwargs),
-            nn.GELU(),
-            nn.Dropout(self._dropout),
-            nn.Linear(self.d_model * 4, self.d_model, **factory_kwargs),
-            nn.Dropout(self._dropout),
+        # DEST3D 风格的门控 FFN
+        self.query_ffn = GatedFFN(
+            in_features=self.d_model,
+            hidden_features=self.d_model * 4,
+            out_features=self.d_model,
+            act_layer=nn.GELU,
+            drop=self._dropout
         )
         self.query_ffn_norm = nn.LayerNorm(self.d_model, **factory_kwargs)
         
@@ -218,26 +216,24 @@ class _SingleDirectionISSMLayer(nn.Module):
     
     def _init_dist_weight_params(self):
         """初始化距离编码相关参数"""
-        # 初始化 dist_mlp（与 DEST3D 的 cpb_mlp 一致）
         for m in self.dist_mlp.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         
-        # 初始化 bc_proj 和 dt_proj
         nn.init.xavier_uniform_(self.bc_proj.weight)
         nn.init.xavier_uniform_(self.dt_proj.weight)
         
     def forward(self, queries, anchors, features_perm, pos_embed_perm, key_pos_3d=None, query_pos=None):
         """
-        前向传播 - 使用 3D 几何距离生成 B、C、dt（DEST3D 风格）
+        前向传播 - 使用 3D 几何距离生成 B、C、dt
         
         Args:
             queries: [B, N_q, d_model] Query 特征
             anchors: [B, N_q, 3] Query 的 3D 锚点位置
-            features_perm: [B, L, d_model] 已重排的特征序列（Key）
-            pos_embed_perm: [B, L, d_model] 已重排的位置编码（Key 的位置）
+            features_perm: [B, L, d_model] 图像特征序列（Key）
+            pos_embed_perm: [B, L, d_model] 位置编码
             key_pos_3d: [B, L, 3] Key 的 3D 位置
             query_pos: [B, N_q, d_model] Query 的位置编码
             
@@ -251,18 +247,9 @@ class _SingleDirectionISSMLayer(nn.Module):
         # 动态设置 d_state = N_q（Query 数量）
         d_state = N_q
         
-        # 调试信息（首次调用时打印）
-        if not hasattr(self, '_debug_printed'):
-            self._debug_printed = True
-            print(f"[ISSM] d_state={d_state}, N_q={N_q}, L={L}, d_dist={self.d_dist}")
-        
-        # ========================================
-        # 隐式位置编码融合
-        # ========================================
         if query_pos is None:
             query_pos = torch.zeros_like(queries)
         
-        # 【隐式融合】特征 + 位置编码 直接相加（StreamPETR 风格）
         query_with_pos = queries + query_pos           # [B, N_q, d_model]
         key_with_pos = features_perm + pos_embed_perm  # [B, L, d_model]
         
@@ -315,65 +302,6 @@ class _SingleDirectionISSMLayer(nn.Module):
             self.dt_bias.view(1, 1, -1, 1)
         )  # [B, L, nheads, N_q=d_state]
         
-        # === 【调试】打印 SSM 内部状态 ===
-        if not hasattr(self, '_ssm_state_debug_printed'):
-            self._ssm_state_debug_printed = True
-            self._debug_iter = 0
-        
-        # 每 50 个 iteration 打印一次详细信息
-        self._debug_iter += 1
-        if self._debug_iter % 50 == 1:
-            with torch.no_grad():
-                # 距离统计
-                if anchors is not None and key_pos_3d is not None:
-                    dist = torch.norm(
-                        key_pos_3d.unsqueeze(2) - anchors.unsqueeze(1), 
-                        dim=-1
-                    )  # [B, L, N_q]
-                    print(f"\n{'='*60}")
-                    print(f"[SSM Debug] Iteration {self._debug_iter}")
-                    print(f"{'='*60}")
-                    print(f"[Distance] min={dist.min().item():.3f}, max={dist.max().item():.3f}, "
-                          f"mean={dist.mean().item():.3f}, std={dist.std().item():.3f}")
-                    print(f"[Distance] <1m: {(dist < 1).float().mean().item()*100:.1f}%, "
-                          f"<5m: {(dist < 5).float().mean().item()*100:.1f}%, "
-                          f"<10m: {(dist < 10).float().mean().item()*100:.1f}%")
-                
-                # 中间特征统计
-                print(f"[intermediate_feat] shape={intermediate_feat.shape}, "
-                      f"min={intermediate_feat.min().item():.4f}, "
-                      f"max={intermediate_feat.max().item():.4f}, "
-                      f"mean={intermediate_feat.mean().item():.4f}")
-                
-                # B, C 参数统计
-                print(f"[B_ssm] shape={B_ssm.shape}, "
-                      f"min={B_ssm.min().item():.4f}, max={B_ssm.max().item():.4f}, "
-                      f"mean={B_ssm.mean().item():.4f}, std={B_ssm.std().item():.4f}")
-                print(f"[C_ssm] shape={C_ssm.shape}, "
-                      f"min={C_ssm.min().item():.4f}, max={C_ssm.max().item():.4f}, "
-                      f"mean={C_ssm.mean().item():.4f}, std={C_ssm.std().item():.4f}")
-                
-                # dt 参数统计（关键：控制状态更新速率）
-                print(f"[dt] shape={dt.shape}, "
-                      f"min={dt.min().item():.6f}, max={dt.max().item():.4f}, "
-                      f"mean={dt.mean().item():.4f}, std={dt.std().item():.4f}")
-                
-                # dt_bias 参数
-                print(f"[dt_bias learnable] values={self.dt_bias.data.cpu().numpy()}")
-                
-                # A 参数（状态衰减）
-                A_val = -torch.exp(self.A_log.float())
-                print(f"[A] (decay rate) values={A_val.data.cpu().numpy()}")
-                
-                # D 参数（skip connection）
-                print(f"[D] (skip) values={self.D.data.cpu().numpy()}")
-                
-                # initial_states 统计
-                print(f"[initial_states] shape={initial_states.shape}, "
-                      f"min={initial_states.min().item():.4f}, max={initial_states.max().item():.4f}, "
-                      f"mean={initial_states.mean().item():.4f}")
-                print(f"{'='*60}\n")
-        
         # === 5. A 参数 ===
         A = -torch.exp(self.A_log.float())
         A = repeat(A, "h -> h d", d=d_state)  # [nheads, d_state]
@@ -389,13 +317,11 @@ class _SingleDirectionISSMLayer(nn.Module):
         y = rearrange(y, "b l h hd -> b l (h hd)")
         D_expanded = self.D.unsqueeze(-1).expand(-1, self.headdim).reshape(-1)
         y = y + x * D_expanded.unsqueeze(0).unsqueeze(0)
-        # 【与 DEST3D 一致】使用 RMSNormGated：norm(y, z) = norm(y) * silu(z)
         y = self.key_norm(y, z)
         out_feat = self.out_key_proj(y)
         out_feat = features_perm + self.dropout(out_feat)  # 残差连接
         
-        # === 8. 【核心】Query 从 last_states 更新 ===
-        # last_states: [B, nheads, headdim, N_q]
+        # === 8. Query 从 last_states 更新 ===
         last_states_reshaped = rearrange(last_states, "b h hd n -> b n (h hd)")  # [B, N_q, d_inner]
         last_states_normed = self.query_norm(last_states_reshaped)
         query_update = self.out_query_proj(last_states_normed)  # [B, N_q, d_model]
@@ -407,69 +333,12 @@ class _SingleDirectionISSMLayer(nn.Module):
         query_ffn_normed = self.query_ffn_norm(out_query)
         out_query = out_query + self.query_ffn(query_ffn_normed)
         
-        # === 【调试】打印 SSM 输出状态 ===
-        if self._debug_iter % 50 == 1:
-            with torch.no_grad():
-                print(f"\n[SSM Output Debug] Iteration {self._debug_iter}")
-                
-                # SSM 输出 y 统计
-                print(f"[y (SSM output)] shape={y.shape}, "
-                      f"min={y.min().item():.4f}, max={y.max().item():.4f}, "
-                      f"mean={y.mean().item():.4f}, std={y.std().item():.4f}")
-                
-                # last_states 统计（Query 更新的来源）
-                print(f"[last_states] shape={last_states.shape}, "
-                      f"min={last_states.min().item():.4f}, max={last_states.max().item():.4f}, "
-                      f"mean={last_states.mean().item():.4f}, std={last_states.std().item():.4f}")
-                
-                # query_update 统计（实际加到 Query 上的更新量）
-                print(f"[query_update] shape={query_update.shape}, "
-                      f"min={query_update.min().item():.4f}, max={query_update.max().item():.4f}, "
-                      f"mean={query_update.mean().item():.4f}, std={query_update.std().item():.4f}")
-                
-                # 输出特征统计
-                print(f"[out_feat] min={out_feat.min().item():.4f}, max={out_feat.max().item():.4f}, "
-                      f"mean={out_feat.mean().item():.4f}")
-                print(f"[out_query] min={out_query.min().item():.4f}, max={out_query.max().item():.4f}, "
-                      f"mean={out_query.mean().item():.4f}")
-                
-                # 检查是否有 NaN 或 Inf
-                has_nan = torch.isnan(out_query).any() or torch.isnan(out_feat).any()
-                has_inf = torch.isinf(out_query).any() or torch.isinf(out_feat).any()
-                if has_nan or has_inf:
-                    print(f"[WARNING] NaN detected: {has_nan}, Inf detected: {has_inf}")
-                print(f"{'='*60}\n")
-        
-        # === 10. DDP 兼容性：确保所有参数有梯度 ===
-        ssm_param_sum = self.A_log.sum() + self.D.sum() + self.dt_bias.sum()
-        param_reg = ssm_param_sum * 1e-8
-        out_feat = out_feat + param_reg
-        out_query = out_query + param_reg
         
         return out_query, out_feat
     
     def _run_issm_triton(self, x, dt, A, B, C, initial_states, d_state):
-        """运行层内双向 ISSM 扫描（DEST3D 风格）
-        
-        双向扫描确保 Query 能同时看到序列两端的信息：
-        - 正向扫描：Query 获取序列末尾附近的强信号
-        - 反向扫描：Query 获取序列开头附近的强信号
-        - 取平均：Query 获得全局视野
-        """
-        if not ISSM_TRITON_AVAILABLE:
-            raise RuntimeError(
-                "ISSM Triton implementation not available. "
-                "Please ensure triton is installed: pip install triton>=2.1.0"
-            )
         
         B_batch, L, nheads, headdim = x.shape
-
-        if not hasattr(self, '_triton_compile_printed'):
-            self._triton_compile_printed = True
-            print(f"[ISSM Debug] Calling Triton ISSM kernel with BIDIRECTIONAL scan...")
-            print(f"[ISSM Debug] x: {x.shape}, dt: {dt.shape}, B: {B.shape}, C: {C.shape}")
-            print(f"[ISSM Debug] A: {A.shape}, initial_states: {initial_states.shape}")
-            print(f"[ISSM Debug] chunk_size: {self.chunk_size}, d_state: {d_state}")
         
         # === 正向扫描 ===
         y_fwd, last_states_fwd = ISSM_chunk_scan_combined(
@@ -514,14 +383,6 @@ class _SingleDirectionISSMLayer(nn.Module):
 
 class DenseAlternatingISSMDecoder(BaseModule):
     """
-    ISSM 解码器层容器
-    
-    说明：
-    - 这是一个"层容器"，主要用于管理 ISSM 层和相关配置
-    - forward() 循环由 issm_streampetr_head.py 控制，以实现更灵活的逻辑
-    - 包括：确定性视图重排、隐式双向扫描、加权密集聚合等
-    - B、C、dt 使用 3D 几何距离生成（DEST3D 风格）
-    
     Args:
         num_layers (int): 解码器层数
         d_model (int): 特征维度
@@ -530,7 +391,6 @@ class DenseAlternatingISSMDecoder(BaseModule):
         num_heads (int): 并行头数
         chunk_size (int): Triton 块大小
         dropout (float): Dropout 比例
-        layer_fusion_weight (float): 密集聚合权重，F_L = w * F_{L-1} + (1-w) * F_{L-2}
         d_dist (int): 距离特征的中间维度
     """
     
@@ -543,35 +403,20 @@ class DenseAlternatingISSMDecoder(BaseModule):
         num_heads=8,
         chunk_size=256,
         dropout=0.1,
-        layer_fusion_weight=0.8,  # 密集聚合权重：当前层 vs 前一层
-        d_dist=16,                # 距离特征的中间维度
+        d_dist=16,                
         device=None,
         dtype=None,
         init_cfg=None,
-        **kwargs  # 兼容旧配置文件中的多余参数
+        **kwargs  
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(init_cfg=init_cfg)
         
-        assert num_layers >= 2, "至少需要2层才能实现密集连接"
-        assert 0.0 <= layer_fusion_weight <= 1.0, "layer_fusion_weight 必须在 [0, 1] 范围内"
-        
-        # 检查 Triton ISSM 是否可用
-        if not ISSM_TRITON_AVAILABLE:
-            raise RuntimeError(
-                "Pure Triton ISSM implementation is required but not available. "
-                "Please ensure triton is installed: pip install triton>=2.1.0"
-            )
-        
         # 保存配置（供 head 使用）
         self.num_layers = num_layers
         self.d_model = d_model
-        self.layer_fusion_weight = layer_fusion_weight
         self.d_dist = d_dist
         
-        # 打印配置信息
-        print(f"[DenseAlternatingISSMDecoder] num_layers={num_layers}, "
-              f"layer_fusion_weight={layer_fusion_weight}")
         
         # === ISSM 层堆叠 ===
         self.layers = nn.ModuleList([
