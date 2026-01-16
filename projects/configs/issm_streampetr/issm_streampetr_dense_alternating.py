@@ -56,9 +56,7 @@ queue_length = 1
 num_frame_losses = 1
 collect_keys = ['lidar2img', 'intrinsics', 'extrinsics', 'timestamp', 'img_timestamp', 'ego_pose', 'ego_pose_inv']
 
-# ISSM 参数
-# 注意：现在使用纯 Triton 实现
-# d_state 由 decoder 层内部动态设置
+
 issm_num_heads = 8
 issm_chunk_size = 256
 
